@@ -353,14 +353,3 @@ extension FlutterError {
         )
     }
 }
-
-extension FlutterError {
-    @available(*, deprecated, message: "Use init(code:message:details:) instead")
-    convenience init(error: Error, call: FlutterMethodCall) {
-        self.init(
-            code: "native_error",
-            message: (error as NSError).localizedDescription,
-            details: call.debugDetails    // ← 你想要帶回 Dart 的額外資訊
-        )
-    }
-}
