@@ -51,58 +51,98 @@ public class SwiftMcumgrFlutterPlugin: NSObject, FlutterPlugin {
         )
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
+
+    @inline(__always)
+func callResultOnMain(_ result: @escaping FlutterResult, _ value: Any?) {
+    if Thread.isMainThread {
+        result(value)
+    } else {
+        DispatchQueue.main.async { result(value) }
+    }
+}
+
+@inline(__always)
+func emitOnMain(_ sink: FlutterEventSink?, _ value: Any?) {
+    guard let sink = sink else { return }
+    if Thread.isMainThread {
+        sink(value)
+    } else {
+        DispatchQueue.main.async { sink(value) }
+    }
+}
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        
-        guard let method = FlutterMethod(rawValue: call.method) else {
-            let error = FlutterMethodNotImplemented
-            result(error)
-            return
-        }
-        
-        do {
-            switch method {
-            case .update:
-                try update(call: call)
-                result(nil)
-            case .updateSingleImage:
-                try updateSingleImage(call: call)
-                result(nil)
-            case .initializeUpdateManager:
-                try initializeUpdateManager(call: call, result: result)
-            case .pause:
-                try pause(call: call)
-                result(nil)
-            case .resume:
-                try resume(call: call)
-                result(nil)
-            case .isPaused:
-                result(try isPaused(call: call))
-            case .isInProgress:
-                result(try isInProgress(call: call))
-            case .cancel:
-                try cancel(call: call)
-                result(nil)
-            case .kill:
-                try kill(call: call)
-                result(nil)
-            case .readLogs:
-                result(try readLogs(call: call).serializedData())
-            case .clearLogs:
-                try retrieveManager(call: call).updateLogger.clearLogs()
-                result(nil)
-            case .readImageList:
-                try readImages(call: call, result: result)
-            case .erase:
-                try imageErase(call, result)
-            }
-        } catch let e as FlutterError {
-            result(e)
-        } catch {
-            result(FlutterError(error: error, call: call))
-        }
-        
+    guard let method = FlutterMethod(rawValue: call.method) else {
+        callResultOnMain(result, FlutterMethodNotImplemented)   // ✅ 改這裡
+        return
     }
+
+    do {
+        switch method {
+        case .update:
+            try update(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .updateSingleImage:
+            try updateSingleImage(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .initializeUpdateManager:
+            try initializeUpdateManager(call: call, result: { any in
+                // 若 initializeUpdateManager 內會在背景緒呼叫，統一切回主緒
+                callResultOnMain(result, any)                   // ✅
+            })
+
+        case .pause:
+            try pause(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .resume:
+            try resume(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .isPaused:
+            let v = try isPaused(call: call)
+            callResultOnMain(result, v)                         // ✅
+
+        case .isInProgress:
+            let v = try isInProgress(call: call)
+            callResultOnMain(result, v)                         // ✅
+
+        case .cancel:
+            try cancel(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .kill:
+            try kill(call: call)
+            callResultOnMain(result, nil)                       // ✅
+
+        case .readLogs:
+            let data = try readLogs(call: call).serializedData()
+            callResultOnMain(result, data)                      // ✅
+
+        case .clearLogs:
+            try retrieveManager(call: call).updateLogger.clearLogs()
+            callResultOnMain(result, nil)                       // ✅
+
+        case .readImageList:
+            // 如果 readImages 本身要用 result 回傳，建議在裡頭也包 callResultOnMain
+            try readImages(call: call, result: { any in
+                callResultOnMain(result, any)                   // ✅
+            })
+
+        case .erase:
+            try imageErase(call, { any in                       // 假設這個也是 async 回傳
+                callResultOnMain(result, any)                   // ✅
+            })
+        }
+    } catch let e as FlutterError {
+        callResultOnMain(result, e)                             // ✅
+    } catch {
+        callResultOnMain(result, FlutterError(error: error, call: call)) // ✅
+    }
+}
+
     
     private func initializeUpdateManager(call: FlutterMethodCall, result: @escaping FlutterResult) throws {
         guard let uuidString = call.arguments as? String, let uuid = UUID(uuidString: uuidString) else {
@@ -341,6 +381,17 @@ extension SwiftMcumgrFlutterPlugin: CBCentralManagerDelegate {
     }
     
     
+}
+
+extension FlutterError {
+    @available(*, deprecated, message: "Use init(code:message:details:) instead")
+    convenience init(error: Error, call: FlutterMethodCall) {
+        self.init(
+            code: "native_error",
+            message: (error as NSError).localizedDescription,
+            details: call.debugDetails    // ← 你想要帶回 Dart 的額外資訊
+        )
+    }
 }
 
 extension FlutterError {
