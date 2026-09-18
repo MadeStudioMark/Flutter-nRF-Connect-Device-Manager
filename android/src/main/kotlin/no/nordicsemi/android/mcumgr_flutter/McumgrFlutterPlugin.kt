@@ -1,12 +1,10 @@
 package no.nordicsemi.android.mcumgr_flutter
 
+import android.bluetooth.BluetoothManager
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.bluetooth.BluetoothAdapter
-import android.content.Context
 import android.util.Pair
-import androidx.annotation.NonNull
-import com.google.protobuf.kotlin.toByteString
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -16,14 +14,27 @@ import io.flutter.plugin.common.MethodChannel.Result
 import io.runtime.mcumgr.McuMgrCallback
 import io.runtime.mcumgr.dfu.mcuboot.FirmwareUpgradeManager
 import io.runtime.mcumgr.exception.McuMgrException
+import io.runtime.mcumgr.response.img.McuMgrImageResponse
 import io.runtime.mcumgr.response.img.McuMgrImageStateResponse
 import no.nordicsemi.android.mcumgr_flutter.ext.toProto
-import io.runtime.mcumgr.response.McuMgrResponse
-import io.runtime.mcumgr.response.img.McuMgrImageResponse
-
+import no.nordicsemi.android.mcumgr_flutter.gen.ProtoFirmwareUpgradeConfiguration
+import no.nordicsemi.android.mcumgr_flutter.gen.ProtoListImagesResponse
+import no.nordicsemi.android.mcumgr_flutter.gen.ProtoReadLogCallArguments
+import no.nordicsemi.android.mcumgr_flutter.gen.ProtoUpdateCallArgument
+import no.nordicsemi.android.mcumgr_flutter.gen.ProtoUpdateWithImageCallArguments
 import no.nordicsemi.android.mcumgr_flutter.logging.LoggableMcuMgrBleTransport
-import no.nordicsemi.android.mcumgr_flutter.utils.*
-import no.nordicsemi.android.mcumgr_flutter.gen.*
+import no.nordicsemi.android.mcumgr_flutter.manager.FirmwareUpgradeConfiguration
+import no.nordicsemi.android.mcumgr_flutter.manager.SettingsManager
+import no.nordicsemi.android.mcumgr_flutter.manager.UpdateManager
+import no.nordicsemi.android.mcumgr_flutter.utils.FlutterError
+import no.nordicsemi.android.mcumgr_flutter.utils.FlutterMethod
+import no.nordicsemi.android.mcumgr_flutter.utils.StreamHandler
+import no.nordicsemi.android.mcumgr_flutter.utils.UpdateManagerDoesNotExist
+import no.nordicsemi.android.mcumgr_flutter.utils.UpdateManagerExists
+import no.nordicsemi.android.mcumgr_flutter.utils.WrongArguments
+import no.nordicsemi.android.mcumgr_flutter.utils.guard
+
+private const val settingsManagerErrorCode = "MCU_MGR_SETTINGS_MANAGER"
 
 /** McumgrFlutterPlugin */
 class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
@@ -34,6 +45,8 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	/// This local reference serves to register the plugin with the Flutter Engine and unregister it
 	/// when the Flutter Engine is detached from the Activity
 	private lateinit var methodChannel: MethodChannel
+
+	private lateinit var mainHandler: Handler
 
 	private lateinit var updateStateEventChannel: EventChannel
 	private lateinit var updateProgressEventChannel: EventChannel
@@ -46,11 +59,14 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	private lateinit var context: Context
 
 	private var managers: MutableMap<String, UpdateManager> = mutableMapOf()
+	private lateinit var fsManagerPlugin: FsManagerPlugin
+	private lateinit var customGroupManagerPlugin: CustomGroupManagerPlugin
 
-	private val mainHandler = Handler(Looper.getMainLooper())
+	private lateinit var settingsManager: SettingsManager
 
-	override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+	override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
 		context = flutterPluginBinding.applicationContext
+		mainHandler = Handler(Looper.getMainLooper())
 
 		methodChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "$namespace/method_channel")
 		methodChannel.setMethodCallHandler(this)
@@ -61,13 +77,27 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 		updateProgressEventChannel.setStreamHandler(updateProgressStreamHandler)
 		logEventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "$namespace/log_event_channel")
 		logEventChannel.setStreamHandler(logStreamHandler)
+
+		fsManagerPlugin = FsManagerPlugin(
+			context,
+			logStreamHandler,
+			flutterPluginBinding.binaryMessenger,
+			mainHandler
+		)
+
+		customGroupManagerPlugin = CustomGroupManagerPlugin(
+			context,
+			logStreamHandler,
+			flutterPluginBinding.binaryMessenger,
+			mainHandler
+		)
 	}
 
-	override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+	override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
 		methodChannel.setMethodCallHandler(null)
 	}
 
-	override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
+	override fun onMethodCall(call: MethodCall, result: Result) {
 		val method = FlutterMethod.valueOfOrNull(call.method).guard {
 			result.notImplemented()
 			return
@@ -131,8 +161,66 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 				FlutterMethod.readImageList -> {
 					imageList(call, result)
 				}
+
+				FlutterMethod.confirmImage -> {
+					confirmImage(call, result)
+        		}
+
 				FlutterMethod.erase -> {
-					imageErase(call, result)
+					erase(call, result)
+				}
+        
+				FlutterMethod.initSettings -> {
+					initSettingsManager(call, result)
+				}
+        
+				FlutterMethod.fetchSettings -> {
+					if (::settingsManager.isInitialized) {
+						settingsManager.fetchSettings(result)
+					} else {
+						return result.error(settingsManagerErrorCode, "Settings manager is not initialized", null)
+					}
+				}
+        
+				FlutterMethod.readSetting -> {
+					if (::settingsManager.isInitialized) {
+						val key = call.arguments as? String
+							?: return result.error(settingsManagerErrorCode, "BAD_ARGS", "Expected key")
+						settingsManager.readSettings(key, result)
+
+					} else {
+						return result.error(
+                            settingsManagerErrorCode,
+							"Settings manager is not initialized",
+							null
+						)
+					}
+				}
+
+				FlutterMethod.writeSetting -> {
+					if (::settingsManager.isInitialized) {
+						val args = call.arguments as? Map<*, *>
+							?: return result.error(settingsManagerErrorCode, "BAD_ARGS", "Expected key-value map")
+						val key = args["key"] as? String
+							?: return result.error(settingsManagerErrorCode, "BAD_ARGS", "Expected key in map")
+						val value = args["value"]
+							?: return result.error(settingsManagerErrorCode, "BAD_ARGS", "Expected value in map")
+						settingsManager.writeSetting(key, value, result)
+
+					} else {
+						return result.error(
+                            settingsManagerErrorCode,
+							"Settings manager is not initialized",
+							null
+						)
+					}
+				}
+
+				FlutterMethod.disposeSettings -> {
+					if (::settingsManager.isInitialized) {
+						settingsManager.transport.release()
+					}
+					result.success(null)
 				}
 			}
 		} catch (e: FlutterError) {
@@ -141,25 +229,66 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	}
 
 	@Throws(FlutterError::class)
-	private fun initializeUpdateManager(@NonNull call: MethodCall) {
+	private fun initializeUpdateManager(call: MethodCall) {
 		val address = (call.arguments as? String).guard {
 			throw WrongArguments("Device address expected")
 		}
 		if (managers.containsKey(address)) {
 			throw UpdateManagerExists("Updated manager for provided peripheral already exists")
 		}
-		val device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address)
+		val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+
+		val device = bluetoothManager.adapter.getRemoteDevice(address)
 		val transport = LoggableMcuMgrBleTransport(context, device , logStreamHandler)
-		val updateManager = UpdateManager(transport,
+		val updateManager = UpdateManager(
+			transport,
 			updateStateStreamHandler,
 			updateProgressStreamHandler,
-			logStreamHandler)
+			logStreamHandler
+		)
 
 		managers[address] = updateManager
 	}
 
 	@Throws(FlutterError::class)
-	private fun update(@NonNull call: MethodCall) {
+	private fun initSettingsManager(call: MethodCall, result: Result) {
+		val args = (call.arguments as? Map<*, *>).guard {
+			result.error(settingsManagerErrorCode, "WrongArguments", "Expected map with deviceAddress, padTo4Bytes, and encodeValueToCBOR")
+			throw WrongArguments("Expected map with deviceAddress, padTo4Bytes, and encodeValueToCBOR")
+		}
+
+		val address = (args["deviceAddress"] as? String).guard {
+			result.error(settingsManagerErrorCode, "WrongArguments", "Device address expected in map")
+			throw WrongArguments("Device address expected in map")
+		}
+
+		val padTo4Bytes = args["padTo4Bytes"] as? Boolean ?: false
+		val encodeValueToCBOR = args["encodeValueToCBOR"] as? Boolean ?: false
+		val useByteStringEncoding = args["useByteStringEncoding"] as? Boolean ?: true
+		val precisionMode = args["precisionMode"] as? String ?: "auto"
+
+		val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+
+		val device = bluetoothManager.adapter.getRemoteDevice(address)
+		val transport = LoggableMcuMgrBleTransport(context, device, logStreamHandler)
+		settingsManager = SettingsManager(transport, padTo4Bytes, encodeValueToCBOR, useByteStringEncoding, precisionMode)
+
+		transport.connect(device)
+			.done {
+				transport.setLoggingEnabled(true)
+				settingsManager = SettingsManager(transport, padTo4Bytes, encodeValueToCBOR, useByteStringEncoding, precisionMode)
+				result.success(null)
+			}
+			.fail { _, errorCode ->
+				result.error(settingsManagerErrorCode, "CONNECT_FAILED", "Could not connect to device, code=$errorCode")
+			}
+			.enqueue()
+
+
+	}
+
+	@Throws(FlutterError::class)
+	private fun update(call: MethodCall) {
 		val bytes = (call.arguments as? ByteArray).guard {
 			throw WrongArguments("Can not parse provided arguments: ${call.arguments.javaClass}")
 		}
@@ -195,7 +324,7 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	}
 
 	@Throws(FlutterError::class)
-	private fun updateSingleImage(@NonNull call: MethodCall) {
+	private fun updateSingleImage(call: MethodCall) {
 		val bytes = (call.arguments as? ByteArray).guard {
 			throw WrongArguments("Can not parse provided arguments: ${call.arguments.javaClass}")
 		}
@@ -203,7 +332,7 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 		val updateManager = managers[args.device_uuid].guard {
 			throw UpdateManagerDoesNotExist("Update manager does not exist")
 		}
-		val image = args.firmware_data.toByteArray()
+		val imageData = args.firmware_data.toByteArray()
 
 		val config = args.configuration?.let { config ->
 			return@let FirmwareUpgradeConfiguration(
@@ -227,11 +356,11 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 			)
 		}
 
-		updateManager.start(args.firmware_data.toByteArray(), config)
+		updateManager.start(imageData, config)
 	}
 
 	@Throws(FlutterError::class)
-	private fun retrieveManager(@NonNull call: MethodCall): UpdateManager {
+	private fun retrieveManager(call: MethodCall): UpdateManager {
 		val address = (call.arguments as? String).guard {
 			throw WrongArguments("Device address expected")
 		}
@@ -241,7 +370,7 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	}
 
 	@Throws(FlutterError::class)
-	private fun readLogs(@NonNull call: MethodCall): ByteArray {
+	private fun readLogs(call: MethodCall): ByteArray {
 		val data = (call.arguments as? ByteArray).guard {
 			throw WrongArguments("Device address expected")
 		}
@@ -255,7 +384,7 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 		return updateManager.readAllLogs(clearLogs).encode()
 	}
 
-	private fun kill(@NonNull call: MethodCall) {
+	private fun kill(call: MethodCall) {
 		val address = (call.arguments as? String).guard {
 			throw WrongArguments("Device Address expected")
 		}
@@ -266,7 +395,7 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 	}
 
 	/** Image Manager */
-	private fun imageList(@NonNull call: MethodCall, result: Result) {
+	private fun imageList(call: MethodCall, result: Result) {
 		val address = (call.arguments as? String).guard {
 			throw WrongArguments("Device address expected")
 		}
@@ -301,27 +430,63 @@ class McumgrFlutterPlugin : FlutterPlugin, MethodCallHandler {
 		updateManager.imageManager.list(callback)
 	}
 
-	@Throws(FlutterError::class)
-	private fun imageErase(@NonNull call: MethodCall, result: Result) {
-		val address = (call.arguments as? String) ?: run {
-			result.error("wrong_args", "Device address expected", null)
-			return
+	private fun confirmImage(call: MethodCall, result: Result) {
+		val args = (call.arguments as? Map<*, *>).guard {
+			throw WrongArguments("Expected map arguments with deviceId and hash")
 		}
-		val updateManager = managers[address] ?: run {
-			result.error("no_manager", "Update manager does not exist", null)
-			return
+		val address = (args["deviceId"] as? String).guard {
+			throw WrongArguments("Device address expected")
 		}
-
-		updateManager.imageManager.erase(object : McuMgrCallback<McuMgrImageResponse> {
-			override fun onResponse(response: McuMgrImageResponse) {
+		val hash = (args["hash"] as? ByteArray).guard {
+			throw WrongArguments("Image hash expected")
+		}
+		val updateManager = managers[address].guard {
+			throw UpdateManagerDoesNotExist("Update manager does not exist")
+		}
+    
+		val callback = object : McuMgrCallback<McuMgrImageStateResponse> {
+			override fun onResponse(response: McuMgrImageStateResponse) {
 				mainHandler.post { result.success(null) }
 			}
 
-			override fun onError(exception: io.runtime.mcumgr.exception.McuMgrException) {
-				mainHandler.post {
-					result.error("mcumgr_error", exception.message, null)
-				}
+			override fun onError(exception: McuMgrException) {
+				mainHandler.post { result.error("mcumgr_error", exception.message, null) }
 			}
-		})
+		}
+
+		updateManager.imageManager.confirm(hash, callback)
+  }
+  
+	/** Erases the default secondary image slot or a specific raw image slot channel. */
+	private fun erase(call: MethodCall, result: Result) {
+		val args = (call.arguments as? Map<*, *>).guard {
+			throw WrongArguments("Erase arguments expected")
+		}
+		val address = (args["deviceUuid"] as? String).guard {
+			throw WrongArguments("Device UUID expected")
+		}
+		val channel = (args["channel"] as? Number)?.toInt()
+		if (channel != null && channel < 0) {
+			throw WrongArguments("Channel must not be negative")
+		}
+		val updateManager = managers[address].guard {
+			throw UpdateManagerDoesNotExist("Update manager does not exist")
+		}
+
+		val callback = object : McuMgrCallback<McuMgrImageResponse> {
+			override fun onResponse(response: McuMgrImageResponse) {
+				result.success(null)
+			}
+
+			override fun onError(exception: McuMgrException) {
+				result.error("mcumgr_error", exception.message, null)
+			}
+		}
+
+		if (channel == null) {
+			updateManager.imageManager.erase(callback)
+		} else {
+			updateManager.imageManager.erase(channel, callback)
+		}
 	}
 }
